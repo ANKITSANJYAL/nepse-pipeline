@@ -154,13 +154,21 @@ def step_authenticated() -> None:
                    (time.perf_counter() - t0) * 1000)
             return
 
+        # Availability, not reachability: NEPSE wipes the session a few hours
+        # after close and serves a bare [] until the next one opens. An empty
+        # floorsheet at 02:00 NPT says nothing about whether this IP is served.
         t0 = time.perf_counter()
         try:
             page = s.floorsheet_page(0, size=50)
-            n = len(page.get("floorsheets", {}).get("content", [])) if isinstance(page, dict) else 0
-            total = page.get("floorsheets", {}).get("totalElements") if isinstance(page, dict) else None
-            record("auth.floorsheet", "OK" if n else "ERROR",
-                   f"rows={n} upstream_total={total}", (time.perf_counter() - t0) * 1000)
+            if isinstance(page, dict):
+                fs = page.get("floorsheets", {})
+                n, total = len(fs.get("content", [])), fs.get("totalElements")
+                record("auth.floorsheet", "OK" if n else "INFO",
+                       f"rows={n} upstream_total={total}", (time.perf_counter() - t0) * 1000)
+            else:
+                record("auth.floorsheet", "INFO",
+                       "bare [] - no live session right now (expected out of hours)",
+                       (time.perf_counter() - t0) * 1000)
         except Exception as exc:  # noqa: BLE001
             record("auth.floorsheet", classify(exc), f"{type(exc).__name__}: {exc}",
                    (time.perf_counter() - t0) * 1000)
@@ -169,9 +177,9 @@ def step_authenticated() -> None:
         d = (datetime.now(NPT).date() - timedelta(days=1)).isoformat()
         t0 = time.perf_counter()
         try:
-            page = s.eod_prices(d, page=0, size=50)
+            page = s.eod_prices(d, page=0, size=500)
             n = len(page.get("content", [])) if isinstance(page, dict) else 0
-            record("auth.eod-board", "OK" if n else "ERROR", f"date={d} rows={n}",
+            record("auth.eod-board", "OK" if n else "INFO", f"date={d} rows={n}",
                    (time.perf_counter() - t0) * 1000)
         except Exception as exc:  # noqa: BLE001
             record("auth.eod-board", classify(exc), f"{type(exc).__name__}: {exc}",
@@ -188,13 +196,19 @@ def main() -> int:
     step_browser_ua()
     step_authenticated()
 
-    critical = {r["step"]: r["outcome"] for r in results
-                if r["step"] in {"auth.market-status", "auth.floorsheet"}}
-    ok = critical.get("auth.market-status") == "OK" and critical.get("auth.floorsheet") == "OK"
+    # The go/no-go is *reachability*, which only these two can answer: TLS to the
+    # host, and one authenticated read through the full WASM-token chain.
+    # market-status answers at any hour; floorsheet and the EOD board depend on
+    # where we are in the trading day, so they inform but never decide.
+    by_step = {r["step"]: r["outcome"] for r in results}
+    ok = by_step.get("tls.handshake") == "OK" and by_step.get("auth.market-status") == "OK"
 
     print("\n" + "=" * 72)
     if ok:
         print("VERDICT: HOSTABLE — NEPSE served this IP through the full auth chain.")
+        if by_step.get("auth.floorsheet") != "OK":
+            print("         (No live floorsheet right now - that is the session window,")
+            print("          not the IP. Capture runs 15:30 NPT, when it is served.)")
     else:
         hung = any(r["outcome"] == "HUNG" for r in results if r["step"].startswith("auth."))
         if hung:
@@ -204,7 +218,17 @@ def main() -> int:
             print("VERDICT: FAILED — see the step outcomes above; not a clean IP block.")
     print("=" * 72)
 
-    print("\n" + json.dumps({"hostable": ok, "steps": results}, indent=2))
+    payload = {"hostable": ok, "steps": results}
+    print("\n" + json.dumps(payload, indent=2))
+
+    # Surface the verdict where it can be read without admin rights on the repo.
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as fh:
+            fh.write(f"## Probe verdict: {'HOSTABLE' if ok else 'NOT HOSTABLE'}\n\n")
+            fh.write("| step | outcome | detail | ms |\n|---|---|---|---|\n")
+            for r in results:
+                fh.write(f"| `{r['step']}` | **{r['outcome']}** | {r['detail']} | {r['ms'] or ''} |\n")
     return 0 if ok else 1
 
 
