@@ -189,7 +189,10 @@ OK rather than collapsing them into "it broke".
 - **Corporate actions are not adjusted.** Bonus shares and rights issues are
   common on NEPSE and will leave fake gaps in any price series. An adjustment
   table is required before this data is fit for modelling.
-- **History beyond 365 days is second-source, not NEPSE.** `eod_history_ext`
+- **History beyond 365 days is second-source, not NEPSE.** Re-verified 2026-08-21
+  against the per-security route with an explicit `startDate=2010-01-01`: it
+  returns exactly 365 days with `totalPages=1`, so the clamp is server-side and
+  there is no deeper authoritative source to prefer. `eod_history_ext`
   comes from ShareSansar and is tagged with its origin; it is never merged into
   the NEPSE tables. Trust it as far as the reconciliation below justifies.
 - **Index intraday history before today cannot be recovered** — same capture-or-lose-it property as floorsheet.

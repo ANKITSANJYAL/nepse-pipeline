@@ -5,9 +5,15 @@ is the source of truth, and the DuckDB file is a derived artifact** rebuilt from
 it on demand. Nothing durable then lives on the machine that ran the job, so the
 pipeline can run on an ephemeral CI runner that is destroyed 15 minutes later.
 
-Only NEPSE-sourced tables are published. `eod_history_ext` is deliberately
-excluded: it is ShareSansar's compiled series, and republishing someone else's
-compilation is a heavier act than republishing the exchange's own prints.
+Both NEPSE-sourced and second-source tables are published, but never merged.
+`eod_history_ext` keeps its `source` column, so every row states its own
+provenance and a consumer who wants exchange-authoritative data only can filter
+it out. Merging the two into one series would make that distinction
+unrecoverable, which is why it is not done here.
+
+NEPSE's own API cannot supply pre-2025 data at all - verified 2026-08-21, an
+explicit `startDate=2010-01-01` on the per-security history route returns
+exactly 365 days - so the deep history has no authoritative alternative.
 """
 
 from __future__ import annotations
@@ -34,10 +40,16 @@ PUBLISHED: tuple[tuple[str, str], ...] = (
     ("daily_stats", "gold"),
 )
 
+# Not partitioned by date: 31 years is ~10 MB, and a business_date partition
+# would mean ~7,000 files of a few KB each. Published as one file per source.
+WHOLE_FILE_TABLES: tuple[tuple[str, str], ...] = (
+    ("eod_history_ext", "silver"),
+)
+
 DATASET_CARD = """---
 license: other
 language: [en]
-tags: [finance, stock-market, nepal, nepse, order-flow, ohlcv]
+tags: [finance, stock-market, nepal, nepse, order-flow, ohlcv, time-series]
 pretty_name: NEPSE Market Data
 ---
 
@@ -46,47 +58,82 @@ pretty_name: NEPSE Market Data
 Daily and tick-level data from the Nepal Stock Exchange, captured by an
 open-source pipeline and validated at every layer boundary.
 
+**Daily prices reach back to 1995-07-20. Tick data starts 2026-08-19.** That gap
+is a property of the source, not a backlog - see *Coverage* below.
+
 ## Tables
 
-| Path | Grain | Notes |
-|---|---|---|
-| `floorsheet/` | one executed contract | microsecond `trade_time`, **both** counterparty broker IDs |
-| `eod_price/` | symbol x day | the official end-of-day board |
-| `bars_1m/` | symbol x minute | derived from floorsheet, reconciles to it exactly |
-| `broker_flow_daily/` | symbol x broker x day | signed participation per broker |
-| `daily_stats/` | symbol x day | traded VWAP and session boundaries |
+| Path | Grain | Source | Coverage |
+|---|---|---|---|
+| `eod_history_ext/` | symbol x day | **ShareSansar** (second source) | 1995-07-20 -> present, 653 symbols |
+| `eod_price/` | symbol x day | NEPSE (authoritative) | rolling 365 days, richer columns |
+| `floorsheet/` | one executed contract | NEPSE (authoritative) | from 2026-08-19, accumulating |
+| `bars_1m/` | symbol x minute | derived from floorsheet | from 2026-08-19 |
+| `broker_flow_daily/` | symbol x broker x day | derived from floorsheet | from 2026-08-19 |
+| `daily_stats/` | symbol x day | derived from floorsheet | from 2026-08-19 |
 
-All are Parquet, partitioned by `business_date`.
+`floorsheet` names **both** counterparty brokers on every trade with a
+microsecond timestamp - something most exchanges never expose.
 
 ## Load it
 
 ```python
-import polars as pl
-df = pl.read_parquet("hf://datasets/{repo_id}/floorsheet/**/*.parquet")
-```
-
-```python
 import duckdb
-duckdb.sql("SELECT * FROM 'hf://datasets/{repo_id}/eod_price/**/*.parquet' LIMIT 5")
+
+# 31 years of daily bars
+duckdb.sql("SELECT * FROM 'hf://datasets/{repo_id}/eod_history_ext/*.parquet'")
+
+# tick-level contracts
+duckdb.sql("SELECT * FROM 'hf://datasets/{repo_id}/floorsheet/**/*.parquet'")
 ```
 
-## What to know before modelling
+## Provenance - read this before combining tables
+
+The two daily tables are **deliberately not merged**, and `eod_history_ext`
+carries a `source` column on every row so it always identifies itself.
+
+- `eod_price` is NEPSE's own end-of-day board. Authoritative, but NEPSE's API
+  clamps every history endpoint to a rolling 365 days. Verified 2026-08-21: an
+  explicit `startDate=2010-01-01` on the per-security route returns exactly 365
+  days, `totalPages=1`. There is no deeper authoritative source.
+- `eod_history_ext` is compiled by [ShareSansar](https://www.sharesansar.com/)
+  and is the only route to pre-2025 data. Credit for that compilation is theirs.
+
+**How far to trust the second source.** On the 226-day window where both exist:
+
+| Check | Result |
+|---|---|
+| Overlapping rows | 75,671 (every NEPSE row matched) |
+| Traded volume identical | **75,671 / 75,671 - 100.00%** |
+| Close price identical | 75,657 / 75,671 - 99.98% |
+
+The 14 close disagreements are 4 debentures already flagged
+`close_outside_range` plus 10 single-session differences under 1%. Volume
+agreeing on every row is the strong signal: both sources describe the same
+trades. This validates the *mechanism*; nothing independently verifies the
+pre-2025 portion.
+
+## What will bite you when modelling
 
 - **Corporate actions are not adjusted.** Bonus shares and rights issues are
-  common on NEPSE and leave artificial gaps in any raw price series.
-- **Tick history starts when the pipeline did.** NEPSE's floorsheet endpoint
-  serves only the current session and ignores the date requested, so tick data
-  cannot be backfilled by anyone, ever. It accumulates one session at a time.
+  common on NEPSE and leave artificial overnight gaps in any raw price series.
+  Returns computed on the raw close will contain those artefacts.
+- **Tick history cannot be backfilled by anyone.** NEPSE's floorsheet endpoint
+  serves only the current session and ignores the date requested. It accumulates
+  one session at a time and a missed day is gone permanently.
 - **The trading week changed.** NEPSE traded Sunday-Thursday until roughly
   2026-04-06, then Monday-Friday. A naive weekday filter drops real sessions.
-- Every published session passed a completeness gate against upstream's own
-  row count, plus uniqueness, null, and `qty * rate = amount` checks.
+- **The early years are thin.** 1995-2002 is a single symbol. The market only
+  becomes broadly observable from 2011 (93 symbols); 125 symbols carry 10+ years.
+- Every published session passed a completeness gate against upstream's own row
+  count, plus uniqueness, null, and `qty * rate = amount` checks.
 
-## Provenance
+## Licence and use
 
-Captured from NEPSE's public web API. NEPSE publishes this data free to any
-browser; this dataset is provided for research and educational use. Commercial
-redistribution may require a licence from NEPSE.
+NEPSE publishes its data free to any browser and ShareSansar's `robots.txt`
+permits crawling. This dataset is provided for research and educational use.
+Commercial redistribution may require a licence from NEPSE. If you are
+ShareSansar or NEPSE and want this changed, open a discussion on this repo.
 
 Pipeline source: {source_url}
 """
@@ -167,6 +214,13 @@ def push(
 
     ops = []
     skipped = 0
+    for table, layer in WHOLE_FILE_TABLES:
+        for f in sorted((cfg.data_root / layer / table).glob("*.parquet")):
+            ops.append(
+                CommitOperationAdd(
+                    path_in_repo=f"{table}/{f.name}", path_or_fileobj=str(f)
+                )
+            )
     for table, part_name, part_dir in parts:
         part_date = part_name.split("=", 1)[-1]
         for f in sorted(part_dir.glob("*.parquet")):
@@ -209,6 +263,18 @@ def pull(repo_id: str, cfg: Config = CONFIG, *, token: str | None = None) -> dic
         return {"downloaded": 0}
 
     n = 0
+    for table, layer in WHOLE_FILE_TABLES:
+        src = Path(local) / table
+        if not src.exists():
+            continue
+        dst = cfg.data_root / layer / table
+        dst.mkdir(parents=True, exist_ok=True)
+        for f in src.glob("*.parquet"):
+            target = dst / f.name
+            if not target.exists():
+                target.write_bytes(f.read_bytes())
+                n += 1
+
     for table, layer in PUBLISHED:
         src = Path(local) / table
         if not src.exists():
