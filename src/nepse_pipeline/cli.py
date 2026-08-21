@@ -64,6 +64,40 @@ def cmd_eod(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_capture(args: argparse.Namespace) -> int:
+    """One post-close capture: sweep, gate, EOD board, gold, index.
+
+    Exits 0 when there is simply no session to capture - a weekend, or one of
+    Nepal's many public holidays. A workflow that goes red on every holiday
+    trains its owner to ignore red, which is the last thing you want guarding a
+    dataset that cannot be backfilled. Real failures still exit non-zero.
+    """
+    with NepseSession() as s:
+        r = fs_job.sweep_until_complete(s)
+        print(r)
+
+        bd = r.get("business_date")
+        if not bd:
+            print("no session available - weekend, holiday, or already wiped. "
+                  "nothing to capture.")
+            return 0
+
+        fs_job.finalize(bd, r.get("upstream_total"))
+
+        # The index dies a few hours after close, so take it before the slower
+        # EOD and gold work rather than after.
+        try:
+            _capture_index(s)
+        except Exception:
+            log.exception("index_capture_failed date=%s", bd)
+
+        print(eod_job.fetch_day(s, bd))
+        eod_job.finalize(bd)
+
+    print(gold_job.build(bd))
+    return 0
+
+
 def cmd_backfill(args: argparse.Namespace) -> int:
     with NepseSession() as s:
         print(eod_job.backfill(s, days=args.days, resume=not args.no_resume))
@@ -230,6 +264,10 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--date")
     e.add_argument("--finalize", action="store_true")
     e.set_defaults(fn=cmd_eod)
+
+    sub.add_parser(
+        "capture", help="one post-close capture: floorsheet, EOD, gold, index"
+    ).set_defaults(fn=cmd_capture)
 
     b = sub.add_parser("backfill", help="walk back through the 365-day window")
     b.add_argument("--days", type=int, default=None)

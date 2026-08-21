@@ -53,12 +53,10 @@ jobs:
         run: PYTHONPATH=src python -m nepse_pipeline.cli warehouse pull
 
       - name: Capture the session
-        run: |
-          set -o pipefail
-          PYTHONPATH=src python -m nepse_pipeline.cli floorsheet --full --finalize
-          PYTHONPATH=src python -m nepse_pipeline.cli eod --finalize
-          PYTHONPATH=src python -m nepse_pipeline.cli gold
-          PYTHONPATH=src python -m nepse_pipeline.cli index || echo "index unavailable (wiped) - continuing"
+        # Exits 0 with a notice when there is no session (weekend, holiday, or
+        # already wiped), non-zero only on a real failure - so a red run always
+        # means something actually needs looking at.
+        run: PYTHONPATH=src python -m nepse_pipeline.cli capture
 
       - name: Publish to Hugging Face
         run: PYTHONPATH=src python -m nepse_pipeline.cli warehouse push
