@@ -139,6 +139,51 @@ reporting the same trades.
 That earns confidence in the *mechanism*, not a guarantee about 1998. Nothing
 verifies the pre-2025 portion, and corporate actions are still unadjusted there.
 
+## Hosted capture (free)
+
+The capture runs on GitHub Actions and publishes to Hugging Face. Both are free:
+public repositories get unmetered Actions minutes, and dataset repos cost nothing.
+
+**Published dataset:** https://huggingface.co/datasets/AnkitSanjyal/nepse-market-data
+
+```python
+import duckdb
+duckdb.sql("SELECT * FROM 'hf://datasets/AnkitSanjyal/nepse-market-data/floorsheet/**/*.parquet'")
+```
+
+### Why post-close instead of a live poller
+
+NEPSE keeps serving the current session's floorsheet for hours after the 15:00
+NPT close - measured complete at +2h and again at +5.5h, wiped by +5.9h. A single
+short run after close therefore captures the same contracts a four-hour poller
+would, at a twentieth of the compute. The intraday index is the exception: it is
+gone about 4h after close, which is what sets the deadline.
+
+The workflow runs twice (09:45 and 11:15 UTC, Mon-Fri) because GitHub delays
+scheduled jobs by 10-30 minutes routinely and occasionally drops one. Every write
+is an upsert, so the second run is a no-op when the first succeeded.
+
+### Parquet is the source of truth
+
+`./nepse warehouse pull` downloads the published Parquet and rebuilds DuckDB from
+it; `push` uploads new and recently-rewritten partitions. The DuckDB file is a
+derived artifact, which is what lets the pipeline run on a CI runner that is
+destroyed minutes later. Verified lossless on 2026-08-21: a warehouse rebuilt
+from Parquet alone reproduced all five tables exactly, floorsheet turnover
+included, to the paisa.
+
+### Setup
+
+| Where | Name | Value |
+|---|---|---|
+| GitHub repo secret | `HF_TOKEN` | a Hugging Face **write** token |
+| GitHub repo variable | `HF_DATASET_REPO` | `AnkitSanjyal/nepse-market-data` |
+
+Run the `probe-reachability` workflow first. NEPSE's failure mode is a silent
+hang rather than a 403, so whether it answers a datacenter IP has to be measured
+before the capture job is trusted - the probe reports HUNG, REFUSED, HTTP_4XX or
+OK rather than collapsing them into "it broke".
+
 ## Known gaps
 
 - **Corporate actions are not adjusted.** Bonus shares and rights issues are
@@ -150,7 +195,8 @@ verifies the pre-2025 portion, and corporate actions are still unadjusted there.
 - **Index intraday history before today cannot be recovered** — same capture-or-lose-it property as floorsheet.
 - **Market depth / order book is not collected.** It costs one request per
   symbol and was deliberately deferred.
-- **A sleeping laptop loses the session.** NEPSE trades 11:00-15:00 NPT, which
+- **A sleeping laptop loses the session.** (Superseded by hosted capture above,
+  but recorded because it cost three sessions before it was fixed.) NEPSE trades 11:00-15:00 NPT, which
   is 01:15-05:15 US Eastern; a MacBook on battery is in Deep Idle sleep for all
   of it and `KeepAlive` does not wake a sleeping host. Measured on 2026-08-20:
   the agent was alive the whole time and captured nothing. Recovered by hand

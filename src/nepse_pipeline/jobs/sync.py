@@ -13,12 +13,17 @@ compilation is a heavier act than republishing the exchange's own prints.
 from __future__ import annotations
 
 import logging
+from datetime import date, timedelta
 from pathlib import Path
 
 from ..config import CONFIG, Config
 from ..storage import connect
 
 log = logging.getLogger(__name__)
+
+# A partition this recent is re-uploaded even if the repo already has it,
+# because re-finalizing a session rewrites its Parquet.
+REWRITE_WINDOW_DAYS = 5
 
 # (table, layer) - layer is the directory under data/ the partitions live in.
 PUBLISHED: tuple[tuple[str, str], ...] = (
@@ -147,18 +152,30 @@ def push(
         log.warning("push_nothing_to_do")
         return {"uploaded": 0}
 
+    # Re-uploading every partition on every session would mean ~230 files a day
+    # for data that has not changed. Upload what the repo lacks, plus a recent
+    # window: a day can legitimately be rewritten when it is re-finalized.
+    try:
+        existing = set(api.list_repo_files(repo_id, repo_type="dataset"))
+    except Exception:  # noqa: BLE001 - first run, repo has no files yet
+        existing = set()
+    cutoff = (date.today() - timedelta(days=REWRITE_WINDOW_DAYS)).isoformat()
+
     # One commit for the whole run, so the repo history has one entry per
     # session rather than one per table.
     from huggingface_hub import CommitOperationAdd
 
     ops = []
+    skipped = 0
     for table, part_name, part_dir in parts:
+        part_date = part_name.split("=", 1)[-1]
         for f in sorted(part_dir.glob("*.parquet")):
+            path_in_repo = f"{table}/{part_name}/{f.name}"
+            if path_in_repo in existing and part_date < cutoff:
+                skipped += 1
+                continue
             ops.append(
-                CommitOperationAdd(
-                    path_in_repo=f"{table}/{part_name}/{f.name}",
-                    path_or_fileobj=str(f),
-                )
+                CommitOperationAdd(path_in_repo=path_in_repo, path_or_fileobj=str(f))
             )
 
     card = DATASET_CARD.replace("{repo_id}", repo_id).replace("{source_url}", source_url)
@@ -168,10 +185,10 @@ def push(
         repo_id=repo_id,
         repo_type="dataset",
         operations=ops,
-        commit_message=f"session update: {len(parts)} partitions",
+        commit_message=f"session update: {len(ops) - 1} files",
     )
-    log.info("push_done repo=%s files=%d", repo_id, len(ops))
-    return {"uploaded": len(ops), "repo": repo_id}
+    log.info("push_done repo=%s uploaded=%d skipped=%d", repo_id, len(ops) - 1, skipped)
+    return {"uploaded": len(ops) - 1, "skipped": skipped, "repo": repo_id}
 
 
 def pull(repo_id: str, cfg: Config = CONFIG, *, token: str | None = None) -> dict:
