@@ -12,6 +12,10 @@ dependencies = [
     "nepse @ git+https://github.com/basic-bgnr/NepseUnofficialApi.git",
 ]
 
+# Only the hosted/publish path needs the Hub client; local capture does not.
+[project.optional-dependencies]
+hub = ["huggingface_hub>=0.34"]
+
 [project.scripts]
 nepse = "nepse_pipeline.cli:main"
 

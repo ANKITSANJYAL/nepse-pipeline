@@ -1,0 +1,29 @@
+name: probe-reachability
+
+# Answers one question: does NEPSE serve a GitHub-hosted (datacenter) IP at all?
+# NEPSE's failure mode is a silent hang rather than a 403, so this must be
+# measured deliberately before any capture job is trusted to run here.
+#
+# Run it by hand from the Actions tab. It is not scheduled.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install -q --upgrade pip
+          pip install -q -e .
+
+      - name: Probe NEPSE from this runner
+        run: PYTHONPATH=src python recon/probe_hosted.py

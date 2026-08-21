@@ -1,0 +1,84 @@
+name: capture-session
+
+# Captures one NEPSE session and publishes it to a Hugging Face dataset.
+#
+# Why post-close rather than a live poller: NEPSE keeps serving the current
+# session's floorsheet for a few hours after the 15:00 NPT close (measured
+# complete at +2h and +5.5h, wiped by +5.9h). So a single short run after close
+# gets the same data as a four-hour poller, for a fraction of the compute - and
+# it fits in GitHub's free tier for public repos.
+#
+# The intraday index is the exception: it is gone roughly 4h after close, which
+# is what sets the deadline below.
+
+on:
+  schedule:
+    # 15:00 NPT close = 09:15 UTC. Two runs, because GitHub delays scheduled
+    # workflows by 10-30 min routinely and occasionally drops one entirely.
+    # The second run is a no-op when the first worked - every write is an upsert.
+    - cron: "45 9 * * 1-5"    # 15:30 NPT, +30 min after close
+    - cron: "15 11 * * 1-5"   # 17:00 NPT, +2h - safety net, still inside the index window
+  workflow_dispatch:
+
+concurrency:
+  # Never let the safety-net run collide with a slow primary run.
+  group: capture-session
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # to commit the run-state file that keeps the schedule alive
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_DATASET_REPO: ${{ vars.HF_DATASET_REPO }}
+      NEPSE_DATA_ROOT: ${{ github.workspace }}/data
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install -q --upgrade pip
+          pip install -q -e ".[hub]"
+
+      - name: Pull published Parquet and rebuild the warehouse
+        run: PYTHONPATH=src python -m nepse_pipeline.cli warehouse pull
+
+      - name: Capture the session
+        run: |
+          set -o pipefail
+          PYTHONPATH=src python -m nepse_pipeline.cli floorsheet --full --finalize
+          PYTHONPATH=src python -m nepse_pipeline.cli eod --finalize
+          PYTHONPATH=src python -m nepse_pipeline.cli gold
+          PYTHONPATH=src python -m nepse_pipeline.cli index || echo "index unavailable (wiped) - continuing"
+
+      - name: Publish to Hugging Face
+        run: PYTHONPATH=src python -m nepse_pipeline.cli warehouse push
+
+      - name: Record the run
+        # Also the keepalive: GitHub disables scheduled workflows after 60 days
+        # with no repository activity, and a commit counts as activity.
+        run: |
+          PYTHONPATH=src python -m nepse_pipeline.cli status > STATUS.txt 2>&1 || true
+          git config user.name  "nepse-pipeline[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add STATUS.txt
+          git diff --staged --quiet || git commit -m "capture: $(date -u +%Y-%m-%d) [skip ci]"
+          git push
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.run_id }}
+          path: |
+            data/quarantine/
+          retention-days: 14

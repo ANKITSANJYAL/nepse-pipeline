@@ -43,6 +43,38 @@ JOB = "floorsheet"
 PAGE_SAFETY_FACTOR = 3
 MIN_INCREMENTAL_PAGES = 2
 
+# NEPSE has been observed serving a floorsheet page where *every* row carries a
+# null buyerMemberId, then serving the same page clean seconds later. Taking the
+# first response at face value raises SchemaDriftError and aborts the sweep - and
+# an aborted floorsheet sweep can mean a permanently lost session, because the
+# endpoint only ever serves the current day. Refetch before believing it.
+DRIFT_REFETCH_ATTEMPTS = 3
+
+
+def _fetch_page(session: NepseSession, page: int, bd, cfg: Config):
+    """Fetch, persist to bronze, and parse one page - refetching on apparent drift.
+
+    Returns (raw_payload, ParseResult). Raises SchemaDriftError only if the shape
+    is still wrong after refetching, which is the signal that the endpoint really
+    did change rather than hiccupped.
+    """
+    last: Exception | None = None
+    for attempt in range(DRIFT_REFETCH_ATTEMPTS):
+        payload = session.floorsheet_page(page=page)
+        bronze.write_raw(
+            "floorsheet", payload, business_date=bd, suffix=f"p{page}", cfg=cfg
+        )
+        try:
+            return payload, parse_floorsheet_page(payload)
+        except SchemaDriftError as exc:
+            last = exc
+            log.warning(
+                "floorsheet_page_drift page=%d attempt=%d - refetching: %s",
+                page, attempt, str(exc)[:180],
+            )
+    raise last
+
+
 
 def _rows_held(con, bd: date) -> int:
     return con.execute(
@@ -59,11 +91,8 @@ def sweep(
 ) -> dict:
     """Fetch contracts and upsert. Idempotent; safe to run any number of times."""
     with connect(cfg) as con:
-        first = session.floorsheet_page(page=0)
-        bronze.write_raw("floorsheet", first, suffix="p0", cfg=cfg)
-
         try:
-            res = parse_floorsheet_page(first)
+            first, res = _fetch_page(session, 0, None, cfg)
         except TransientEmptyPage:
             log.warning("floorsheet page 0 empty after retries - nothing to do")
             return {"status": "empty", "fetched": 0, "upstream_total": 0}
@@ -94,10 +123,8 @@ def sweep(
         empty_pages: list[int] = []
 
         for page in range(1, want_pages):
-            payload = session.floorsheet_page(page=page)
-            bronze.write_raw("floorsheet", payload, business_date=bd, suffix=f"p{page}", cfg=cfg)
             try:
-                pres = parse_floorsheet_page(payload)
+                _, pres = _fetch_page(session, page, bd, cfg)
             except TransientEmptyPage:
                 # Recorded, not fatal: the completeness gate below decides
                 # whether the gap actually cost us anything.

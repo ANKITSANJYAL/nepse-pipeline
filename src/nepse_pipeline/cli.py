@@ -98,6 +98,27 @@ def cmd_deep(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_warehouse(args: argparse.Namespace) -> int:
+    """pull/push the published Parquet against a Hugging Face dataset repo."""
+    import os
+
+    from .jobs import sync as sync_job
+
+    repo = args.repo or os.environ.get("HF_DATASET_REPO")
+    if not repo:
+        print("set --repo or HF_DATASET_REPO (e.g. yourname/nepse-market-data)",
+              file=sys.stderr)
+        return 2
+    token = os.environ.get("HF_TOKEN")
+
+    if args.action == "pull":
+        print(sync_job.pull(repo, token=token))
+        print(sync_job.hydrate())
+    else:
+        print(sync_job.push(repo, token=token, source_url=args.source_url))
+    return 0
+
+
 def cmd_index(_: argparse.Namespace) -> int:
     with NepseSession() as s:
         raw = s.index_intraday(58)
@@ -231,6 +252,12 @@ def main(argv: list[str] | None = None) -> int:
     dh.set_defaults(fn=cmd_deep)
 
     sub.add_parser("index", help="capture intraday index series").set_defaults(fn=cmd_index)
+
+    wh = sub.add_parser("warehouse", help="sync published parquet with a HF dataset repo")
+    wh.add_argument("action", choices=["pull", "push"])
+    wh.add_argument("--repo", help="defaults to $HF_DATASET_REPO")
+    wh.add_argument("--source-url", default="https://github.com/")
+    wh.set_defaults(fn=cmd_warehouse)
 
     r = sub.add_parser("run", help="live poll loop (use this under launchd)")
     r.add_argument("--once", action="store_true")

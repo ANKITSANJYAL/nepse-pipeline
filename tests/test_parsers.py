@@ -121,3 +121,30 @@ def test_bronze_name_flattens_slash_symbols():
     assert _bronze_name("GBILD84/85") == "GBILD84%2F85"
     assert "/" not in _bronze_name("nicad85/86")
     assert _bronze_name("nabil") == "NABIL"
+
+
+def test_all_null_broker_page_is_drift_not_silent_loss():
+    """A page where every buyerMemberId is null must raise, not write survivors.
+
+    Observed live on 2026-08-21: NEPSE served 500/500 rows with a null
+    buyerMemberId, then served the same page clean on refetch. The parser's job
+    is to refuse it; the sweep's job is to refetch before believing it.
+    """
+    import json
+    from pathlib import Path
+    from nepse_pipeline.parsers import SchemaDriftError, parse_floorsheet_page
+
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "floorsheet_page.json").read_text()
+    )
+    rows = fixture["floorsheets"]["content"]
+    assert rows, "fixture should carry rows"
+    for r in rows:
+        r["buyerMemberId"] = None
+
+    try:
+        parse_floorsheet_page(fixture)
+    except SchemaDriftError as exc:
+        assert "100%" in str(exc) or "rows failed" in str(exc)
+    else:
+        raise AssertionError("all-null broker page must raise SchemaDriftError")
