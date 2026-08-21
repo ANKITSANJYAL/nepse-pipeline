@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Data is reproducible-ish and large; bronze floorsheet is NOT refetchable,
+# so back it up separately rather than committing it.
+data/
+logs/

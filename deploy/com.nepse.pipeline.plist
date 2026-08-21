@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nepse.pipeline</string>
+
+    <!-- The loop polls NEPSE's own market-open endpoint and idles when closed,
+         so it is timezone-proof: no hardcoded 11:00-15:00 NPT window to drift
+         when NEPSE changes its schedule (it did, in Chaitra 2082). -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PROJECT_DIR__/nepse</string>
+        <string>run</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- A crash mid-session loses floorsheet ticks that cannot be refetched
+         from anywhere, so always restart. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/logs/pipeline.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/logs/pipeline.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>NEPSE_DATA_ROOT</key>
+        <string>__PROJECT_DIR__/data</string>
+    </dict>
+</dict>
+</plist>

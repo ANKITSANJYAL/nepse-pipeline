@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Dev entry point. This venv's Python 3.14.4 does not process .pth files, so
+# `pip install -e .` produces nothing importable; PYTHONPATH is the reliable path.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="$HERE/src${PYTHONPATH:+:$PYTHONPATH}"
+exec "$HERE/.venv/bin/python" -m nepse_pipeline.cli "$@"
