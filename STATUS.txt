@@ -1,5 +1,5 @@
 market   : CLOSE  asOf=2026-08-24 15:00:00  id=80
-npt now  : 2026-08-24 16:14:39 Mon
+npt now  : 2026-08-24 17:36:40 Mon
 freshness: latest floorsheet date=2026-08-24 ingested_at=2026-08-24 10:29:26.794091
   floorsheet      rows=  203,586  range=2026-08-19..2026-08-24
   eod_price       rows=   76,710  range=2025-08-19..2026-08-24
