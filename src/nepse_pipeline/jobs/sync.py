@@ -75,6 +75,16 @@ is a property of the source, not a backlog - see *Coverage* below.
 `floorsheet` names **both** counterparty brokers on every trade with a
 microsecond timestamp - something most exchanges never expose.
 
+## Worked examples
+
+Three analyses with committed outputs — read them without running anything:
+
+| Notebook | Finding |
+|---|---|
+| [Who is actually trading this stock?]({source_url}/blob/main/notebooks/01_broker_network.ipynb) | Large broker positions repeat direction **71.8%** of the time next session |
+| [The corporate actions trap]({source_url}/blob/main/notebooks/02_corporate_actions.ipynb) | NEPSE's ~10% circuit limit doubles as a corporate-action detector; **747 candidates** found from prices alone |
+| [The symbols that disappeared]({source_url}/blob/main/notebooks/03_survivorship.ipynb) | **36%** of symbols are delisted; survivorship bias measured at **+0.74 pts/year** |
+
 ## Load it
 
 ```python

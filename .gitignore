@@ -8,3 +8,7 @@ __pycache__/
 # so back it up separately rather than committing it.
 data/
 logs/
+
+# Notebook scratch
+notebooks/__pycache__/
+.ipynb_checkpoints/

@@ -3,6 +3,16 @@
 Live and historical market data from the Nepal Stock Exchange, landed in DuckDB +
 Parquet with validation at every layer boundary.
 
+## What you can do with it
+
+Three worked analyses, committed with their outputs — see [notebooks/](notebooks/):
+
+| | Finding |
+|---|---|
+| [Who is actually trading this stock?](notebooks/01_broker_network.ipynb) | Large broker positions repeat direction **71.8%** of the time next session; no next-day price edge detectable yet |
+| [The corporate actions trap](notebooks/02_corporate_actions.ipynb) | NEPSE's ~10% circuit limit doubles as a corporate-action detector; **747 candidates** recovered from prices alone |
+| [The symbols that disappeared](notebooks/03_survivorship.ipynb) | **36%** of NEPSE symbols are delisted; survivorship bias measured at **+0.74 pts/year** |
+
 ## Quick start
 
 ```bash
