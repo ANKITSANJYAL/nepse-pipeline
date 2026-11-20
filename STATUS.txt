@@ -1,6 +1,7 @@
-market   : CLOSE  asOf=2026-08-25 15:00:00  id=80
-npt now  : 2026-08-25 15:57:23 Tue
-freshness: latest floorsheet date=2026-08-25 ingested_at=2026-08-25 10:12:10.803681
-  floorsheet      rows=  250,175  range=2026-08-19..2026-08-25
-  eod_price       rows=   77,067  range=2025-08-19..2026-08-25
+run      : 44748903787  job_status=success  utc=2026-11-20T14:02:57Z
+market   : CLOSE  asOf=2026-11-20 15:00:00  id=80
+npt now  : 2026-11-20 19:47:59 Fri
+freshness: latest floorsheet date=2026-11-20 ingested_at=2026-11-20 14:02:47.609284
+  floorsheet      rows=  330,978  range=2026-08-19..2026-11-20
+  eod_price       rows=   93,859  range=2025-08-19..2026-11-20
   index_intraday  rows=        0  range=None..None
