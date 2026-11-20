@@ -18,11 +18,13 @@ exactly 365 days - so the deep history has no authoritative alternative.
 
 from __future__ import annotations
 
+import io
 import logging
-from datetime import date, timedelta
+import tarfile
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from ..config import CONFIG, Config
+from ..config import CONFIG, NPT, Config
 from ..storage import connect
 
 log = logging.getLogger(__name__)
@@ -35,6 +37,8 @@ REWRITE_WINDOW_DAYS = 5
 PUBLISHED: tuple[tuple[str, str], ...] = (
     ("floorsheet", "silver"),
     ("eod_price", "silver"),
+    # Was missing until 2026-11: captured on the runner, then destroyed with it.
+    ("index_intraday", "silver"),
     ("bars_1m", "gold"),
     ("broker_flow_daily", "gold"),
     ("daily_stats", "gold"),
@@ -67,7 +71,8 @@ is a property of the source, not a backlog - see *Coverage* below.
 |---|---|---|---|
 | `eod_history_ext/` | symbol x day | **ShareSansar** (second source) | 1995-07-20 -> present, 653 symbols |
 | `eod_price/` | symbol x day | NEPSE (authoritative) | rolling 365 days, richer columns |
-| `floorsheet/` | one executed contract | NEPSE (authoritative) | from 2026-08-19, accumulating |
+| `floorsheet/` | one executed contract | NEPSE (authoritative) | from 2026-08-19, accumulating; gap 2026-08-26 -> 2026-11-18 |
+| `index_intraday/` | NEPSE index x ~24s | NEPSE (authoritative) | from 2026-11, only sessions captured within ~4h of close |
 | `bars_1m/` | symbol x minute | derived from floorsheet | from 2026-08-19 |
 | `broker_flow_daily/` | symbol x broker x day | derived from floorsheet | from 2026-08-19 |
 | `daily_stats/` | symbol x day | derived from floorsheet | from 2026-08-19 |
@@ -183,9 +188,13 @@ def hydrate(cfg: Config = CONFIG, *, rebuild: bool = True) -> dict:
             if not list(root.glob("business_date=*/*.parquet")):
                 counts[table] = 0
                 continue
-            # Column order is fixed by export (SELECT * FROM table), so a
-            # positional insert is safe and avoids naming 15 columns here.
-            con.execute(f"INSERT INTO {table} BY NAME SELECT * FROM read_parquet('{glob}')")
+            # BY NAME, with hive partitioning off: every file carries its own
+            # columns, and index_intraday has no business_date column, so the
+            # directory name must not be injected as one.
+            con.execute(
+                f"INSERT INTO {table} BY NAME "
+                f"SELECT * FROM read_parquet('{glob}', hive_partitioning = false)"
+            )
             counts[table] = con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
     log.info("hydrate_done %s", counts)
     return counts
@@ -216,7 +225,7 @@ def push(
         existing = set(api.list_repo_files(repo_id, repo_type="dataset"))
     except Exception:  # noqa: BLE001 - first run, repo has no files yet
         existing = set()
-    cutoff = (date.today() - timedelta(days=REWRITE_WINDOW_DAYS)).isoformat()
+    cutoff = (datetime.now(NPT).date() - timedelta(days=REWRITE_WINDOW_DAYS)).isoformat()
 
     # One commit for the whole run, so the repo history has one entry per
     # session rather than one per table.
@@ -253,6 +262,67 @@ def push(
     )
     log.info("push_done repo=%s uploaded=%d skipped=%d", repo_id, len(ops) - 1, skipped)
     return {"uploaded": len(ops) - 1, "skipped": skipped, "repo": repo_id}
+
+
+BRONZE_DATASETS = ("floorsheet", "eod_price", "index_intraday")
+
+
+def bundle_bronze(cfg: Config = CONFIG, *, window_days: int = REWRITE_WINDOW_DAYS) -> list[tuple[str, bytes]]:
+    """Pack recent bronze into one uncompressed tar per (dataset, date).
+
+    One tar instead of ~90 files per session: a year of per-response files
+    would be ~50k objects in the repo, which is the small-files problem in
+    another costume. Members are already gzipped, so tar adds no compression.
+    Returns (path_in_repo, tar_bytes); the name carries the bundle time so a
+    second run the same day adds a bundle instead of replacing the first -
+    bronze is append-only.
+    """
+    stamp = int(datetime.now(NPT).timestamp() * 1000)
+    cutoff = datetime.now(NPT).date() - timedelta(days=window_days)
+    out: list[tuple[str, bytes]] = []
+    for ds in BRONZE_DATASETS:
+        for part in sorted((cfg.bronze / ds).glob("date=*")):
+            try:
+                part_date = date.fromisoformat(part.name.split("=", 1)[1])
+            except ValueError:
+                continue
+            files = sorted(part.glob("*.json.gz"))
+            if part_date < cutoff or not files:
+                continue
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w") as tar:
+                for f in files:
+                    tar.add(f, arcname=f.name)
+            out.append((f"{ds}/{part.name}/bundle-{stamp}.tar", buf.getvalue()))
+    return out
+
+
+def push_bronze(repo_id: str, cfg: Config = CONFIG, *, token: str | None = None) -> dict:
+    """Archive raw responses to a PRIVATE dataset repo.
+
+    Private because a raw mirror of NEPSE's API responses is a step closer to
+    redistribution than the validated tables already published; it exists so
+    a parser bug found later can be fixed by replay, which the hosted path
+    could not do at all because the runner's disk is discarded.
+    """
+    from huggingface_hub import CommitOperationAdd, HfApi
+
+    bundles = bundle_bronze(cfg)
+    if not bundles:
+        log.warning("push_bronze_nothing_to_do")
+        return {"uploaded": 0}
+    api = HfApi(token=token)
+    api.create_repo(repo_id, repo_type="dataset", private=True, exist_ok=True)
+    if not api.repo_info(repo_id, repo_type="dataset").private:
+        # create_repo(exist_ok=True) does not change an existing repo's
+        # visibility. Refuse rather than publish raw data by accident.
+        raise RuntimeError(f"{repo_id} exists and is PUBLIC - refusing to push bronze")
+    ops = [CommitOperationAdd(path_in_repo=p, path_or_fileobj=b) for p, b in bundles]
+    api.create_commit(repo_id=repo_id, repo_type="dataset", operations=ops,
+                      commit_message=f"bronze: {len(ops)} bundles")
+    size = sum(len(b) for _, b in bundles)
+    log.info("push_bronze_done repo=%s bundles=%d bytes=%d", repo_id, len(ops), size)
+    return {"uploaded": len(ops), "bytes": size, "repo": repo_id}
 
 
 def pull(repo_id: str, cfg: Config = CONFIG, *, token: str | None = None) -> dict:

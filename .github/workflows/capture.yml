@@ -27,6 +27,7 @@ concurrency:
 
 permissions:
   contents: write   # to commit the run-state file that keeps the schedule alive
+  issues: write     # to open/update the single "capture failing" issue
 
 jobs:
   capture:
@@ -35,7 +36,10 @@ jobs:
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HF_DATASET_REPO: ${{ vars.HF_DATASET_REPO }}
+      # Optional. When set, raw responses are archived to this PRIVATE repo.
+      HF_BRONZE_REPO: ${{ vars.HF_BRONZE_REPO }}
       NEPSE_DATA_ROOT: ${{ github.workspace }}/data
+      PYTHONPATH: src
 
     steps:
       - uses: actions/checkout@v5
@@ -48,35 +52,82 @@ jobs:
         run: |
           python -m pip install -q --upgrade pip
           pip install -q -e ".[hub]"
+          mkdir -p logs
 
       - name: Pull published Parquet and rebuild the warehouse
-        run: PYTHONPATH=src python -m nepse_pipeline.cli warehouse pull
+        id: pull
+        run: python -m nepse_pipeline.cli warehouse pull 2>&1 | tee logs/pull.log
+        shell: bash   # = bash -eo pipefail: tee must not mask a failure
 
       - name: Capture the session
         # Exits 0 with a notice when there is no session (weekend, holiday, or
         # already wiped), non-zero only on a real failure - so a red run always
         # means something actually needs looking at.
-        run: PYTHONPATH=src python -m nepse_pipeline.cli capture
+        run: python -m nepse_pipeline.cli capture 2>&1 | tee logs/capture.log
+        shell: bash   # = bash -eo pipefail: tee must not mask a failure
 
+      # Publish even when a later stage (EOD gate, gold) failed: every partition
+      # on disk already passed its own quality gate before it was written, and
+      # the floorsheet cannot be refetched tomorrow. Gated only on a good pull,
+      # so a half-hydrated warehouse never overwrites the published copy.
       - name: Publish to Hugging Face
-        run: PYTHONPATH=src python -m nepse_pipeline.cli warehouse push
+        if: ${{ !cancelled() && steps.pull.outcome == 'success' }}
+        run: python -m nepse_pipeline.cli warehouse push --source-url "${{ github.server_url }}/${{ github.repository }}" 2>&1 | tee logs/push.log
+        shell: bash   # = bash -eo pipefail: tee must not mask a failure
 
-      - name: Record the run
-        # Also the keepalive: GitHub disables scheduled workflows after 60 days
-        # with no repository activity, and a commit counts as activity.
+      - name: Archive raw responses (private)
+        if: ${{ !cancelled() && steps.pull.outcome == 'success' }}
+        run: python -m nepse_pipeline.cli warehouse push-bronze 2>&1 | tee logs/push-bronze.log
+        shell: bash   # = bash -eo pipefail: tee must not mask a failure
+
+      # Checks the outcome, not the process: catches a capture that "succeeds"
+      # by finding no session day after day, which no exit code would reveal.
+      - name: Freshness check
+        if: ${{ !cancelled() }}
+        run: python -m nepse_pipeline.cli freshness --max-age-days 7
+
+      - name: Record the run (heartbeat)
+        # Runs on failure too. It is the keepalive: GitHub disables scheduled
+        # workflows after 60 days without repository activity. When this ran
+        # only on success, the 2026-08-25 outage stopped the commits and the
+        # schedule was disabled on its own - the failure hid itself.
+        if: ${{ !cancelled() }}
+        env:
+          JOB_STATUS: ${{ job.status }}
         run: |
-          PYTHONPATH=src python -m nepse_pipeline.cli status > STATUS.txt 2>&1 || true
+          {
+            echo "run      : ${{ github.run_id }}  job_status=${JOB_STATUS}  utc=$(date -u +%FT%TZ)"
+            python -m nepse_pipeline.cli status 2>&1 || true
+          } > STATUS.txt
           git config user.name  "nepse-pipeline[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add STATUS.txt
-          git diff --staged --quiet || git commit -m "capture: $(date -u +%Y-%m-%d) [skip ci]"
-          git push
+          git diff --staged --quiet || git commit -q -m "capture: $(date -u +%Y-%m-%d) ${JOB_STATUS} [skip ci]"
+          git pull -q --rebase && git push -q
+
+      - name: Open or update the failure issue
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="capture-session is failing"
+          body="Run failed: ${RUN_URL}
+          $(tail -n 15 logs/capture.log 2>/dev/null | sed 's/^/    /')"
+          n=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          if [ -n "$n" ]; then
+            gh issue comment "$n" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
 
       - name: Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v5
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7
         with:
           name: logs-${{ github.run_id }}
           path: |
+            logs/
             data/quarantine/
+          if-no-files-found: ignore
           retention-days: 14
