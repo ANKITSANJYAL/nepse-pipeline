@@ -25,26 +25,82 @@ RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
 class NepseError(RuntimeError):
-    pass
+    def __init__(self, msg: str, status: int | None = None) -> None:
+        super().__init__(msg)
+        self.status = status
 
 
 class NepseAuthError(NepseError):
     pass
 
 
+class NepseHostError(NepseError):
+    """The host answered an API route with a web-server HTML page, not the API.
+
+    This is how the 2026-08-25 outage looked: a Host-header mismatch made the
+    `.com.np` server answer a bare nginx 404 on every /api/nots route. It is a
+    request/configuration fault, never "no data", so callers must not read it
+    as a holiday or a history boundary.
+    """
+
+
+class NepseDateOutOfRange(NepseError):
+    """NEPSE refuses a businessDate outside its rolling history window.
+
+    Measured 2026-11-20: 500 + JSON body `Searched Date is not valid.` (it was a
+    404 when first measured in 2026-08). Deterministic, so retrying is waste.
+    """
+
+
+_DATE_OUT_OF_RANGE_MARKER = "Searched Date is not valid"
+
+
+def classify_failure(
+    status: int, content_type: str, body: str, base_url: str, path: str
+) -> NepseError | None:
+    """Pure: map a non-200 response to a deterministic, non-retryable error.
+
+    Returns None when the response should go through the normal retry policy.
+    """
+    if status == 500 and _DATE_OUT_OF_RANGE_MARKER in body:
+        return NepseDateOutOfRange(f"date outside NEPSE history window on {path}", status)
+    if status in (403, 404) and "json" not in content_type.lower() and path.startswith("/api/"):
+        return NepseHostError(
+            f"{base_url} answered {path} with a {status} HTML page, not the API. "
+            f"Check NEPSE_BASE_URL and that no foreign Host header is sent (2026-08-25 outage). "
+            f"Body: {body[:120]!r}",
+            status,
+        )
+    return None
+
+
 class _TokenSource:
     """Adapter over the `nepse` package. Owns nothing but token + payload ids."""
 
-    def __init__(self) -> None:
+    def __init__(self, base_url: str) -> None:
         from nepse import Nepse  # imported lazily: heavy (pywasm) and optional
 
         self._n = Nepse()
         self._n.setTLSVerification(False)  # NEPSE's chain has been intermittently broken
+        # The library hardcodes its own host for the calls it makes itself
+        # (token, market status, security map). Pin it to ours so every
+        # request in the process talks to one host.
+        self._n.base_url = base_url.rstrip("/")
+        self._n.load_json_header()  # recomputes Host/Referer from base_url
         self._lock = threading.Lock()
 
     def auth_headers(self) -> dict[str, str]:
+        """Only the token. Never the library's other headers.
+
+        `getAuthorizationHeaders()` returns the library's whole header set,
+        including `Host: www.nepalstock.com` and its own Firefox 89 UA. Merged
+        into our requests, that sent `Host: .com` to the `.com.np` server - a
+        different machine (182.93.68.4 vs 110.44.116.20). It tolerated that
+        until 2026-08-25 and has answered nginx 404 since. Verified 2026-11-20:
+        same token, Host stripped -> 200; Host left in -> 404.
+        """
         with self._lock:
-            return dict(self._n.getAuthorizationHeaders())
+            return {"Authorization": self._n.getAuthorizationHeaders()["Authorization"]}
 
     def floorsheet_payload_id(self) -> int:
         with self._lock:
@@ -68,7 +124,7 @@ class NepseSession:
 
     def __init__(self, cfg: Config = CONFIG) -> None:
         self.cfg = cfg
-        self._tokens = _TokenSource()
+        self._tokens = _TokenSource(cfg.base_url)
         self._last_request_at = 0.0
         self._gap_lock = threading.Lock()
         self._client = httpx.Client(
@@ -150,20 +206,26 @@ class NepseSession:
             if r.status_code == 200:
                 return r.json()
 
+            classified = classify_failure(r.status_code, r.headers.get("content-type", ""),
+                                          r.text, self.cfg.base_url, path)
+            if classified is not None:
+                raise classified
+
             # 401 = our 45s token aged out mid-flight. Refresh and retry immediately.
             if r.status_code == 401:
-                last_exc = NepseAuthError(f"401 on {path}")
+                last_exc = NepseAuthError(f"401 on {path}", 401)
                 self._sleep_backoff(attempt, cap=2.0)
                 continue
 
             if r.status_code in RETRYABLE_STATUS:
-                last_exc = NepseError(f"{r.status_code} on {path}")
+                last_exc = NepseError(f"{r.status_code} on {path}", r.status_code)
                 self._sleep_backoff(attempt)
                 continue
 
             # Any other 4xx is a bug in our request, not a transient fault.
             # Retrying it just burns quota and hides the defect.
-            raise NepseError(f"non-retryable {r.status_code} on {path}: {r.text[:200]}")
+            raise NepseError(f"non-retryable {r.status_code} on {path}: {r.text[:200]}",
+                             r.status_code)
 
         raise NepseError(f"exhausted {self.cfg.max_retries} attempts on {path}") from last_exc
 

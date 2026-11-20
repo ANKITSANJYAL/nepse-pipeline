@@ -8,6 +8,7 @@ import sys
 import time
 from datetime import date, datetime
 
+from . import bronze
 from .config import CONFIG, NPT
 from .jobs import eod as eod_job
 from .jobs import floorsheet as fs_job
@@ -17,7 +18,7 @@ from .jobs import deep_history as deep_job
 from .parsers import parse_index_series, parse_market_status
 from .quality import freshness
 from .session import NepseSession
-from .storage import connect, upsert_index
+from .storage import connect, export_index_intraday, upsert_index
 
 log = logging.getLogger("nepse")
 
@@ -73,6 +74,11 @@ def cmd_capture(args: argparse.Namespace) -> int:
     dataset that cannot be backfilled. Real failures still exit non-zero.
     """
     with NepseSession() as s:
+        # The index has the shortest deadline (wiped ~4h after close, while the
+        # floorsheet has been seen surviving overnight), and it is one request.
+        # Take it before the two-minute floorsheet sweep, not after.
+        _capture_index(s)
+
         r = fs_job.sweep_until_complete(s)
         print(r)
 
@@ -83,13 +89,6 @@ def cmd_capture(args: argparse.Namespace) -> int:
             return 0
 
         fs_job.finalize(bd, r.get("upstream_total"))
-
-        # The index dies a few hours after close, so take it before the slower
-        # EOD and gold work rather than after.
-        try:
-            _capture_index(s)
-        except Exception:
-            log.exception("index_capture_failed date=%s", bd)
 
         print(eod_job.fetch_day(s, bd))
         eod_job.finalize(bd)
@@ -148,6 +147,14 @@ def cmd_warehouse(args: argparse.Namespace) -> int:
     if args.action == "pull":
         print(sync_job.pull(repo, token=token))
         print(sync_job.hydrate())
+    elif args.action == "push-bronze":
+        bronze_repo = os.environ.get("HF_BRONZE_REPO")
+        if not bronze_repo:
+            # Opt-in by design: this creates a repo, so it needs a deliberate
+            # setting rather than a default. Not an error for the workflow.
+            print("HF_BRONZE_REPO not set - raw responses not archived this run")
+            return 0
+        print(sync_job.push_bronze(bronze_repo, token=token))
     else:
         print(sync_job.push(repo, token=token, source_url=args.source_url))
     return 0
@@ -155,24 +162,54 @@ def cmd_warehouse(args: argparse.Namespace) -> int:
 
 def cmd_index(_: argparse.Namespace) -> int:
     with NepseSession() as s:
-        raw = s.index_intraday(58)
-        pts = parse_index_series(raw)
+        _capture_index(s, 58)
     with connect() as con:
-        n = upsert_index(con, 58, pts)
-    print(f"index points upserted: {n}  span={pts[0][0]}..{pts[-1][0]}" if pts else "no points")
+        row = con.execute("SELECT count(*), min(ts), max(ts) FROM index_intraday "
+                          "WHERE CAST(ts AS DATE) = (SELECT max(CAST(ts AS DATE)) FROM index_intraday)"
+                          ).fetchone()
+    print(f"index points (latest day): {row[0]}  span={row[1]}..{row[2]}")
     return 0
 
 
 def _capture_index(s: NepseSession, index_id: int = 58) -> None:
-    """Idempotent: the endpoint returns the whole day each call, upserted by ts."""
+    """Idempotent: the endpoint returns the whole day each call, upserted by ts.
+
+    Bronze first, like every other dataset: the series is wiped hours after
+    close, so the raw response is the only copy that can ever be replayed.
+    """
     try:
-        pts = parse_index_series(s.index_intraday(index_id))
-        if pts:
-            with connect() as con:
-                upsert_index(con, index_id, pts)
-            log.info("index_captured points=%d span=%s..%s", len(pts), pts[0][0], pts[-1][0])
+        raw = s.index_intraday(index_id)
+        pts = parse_index_series(raw)
+        if not pts:
+            log.warning("index_empty index_id=%d - already wiped or no session", index_id)
+            return
+        bronze.write_raw("index_intraday", raw, business_date=pts[-1][0].date(),
+                         suffix=f"i{index_id}")
+        with connect() as con:
+            upsert_index(con, index_id, pts)
+            for d in sorted({ts.date() for ts, _ in pts}):
+                export_index_intraday(con, d)
+        log.info("index_captured points=%d span=%s..%s", len(pts), pts[0][0], pts[-1][0])
     except Exception:
         log.exception("index_capture_failed")
+
+
+def cmd_freshness(args: argparse.Namespace) -> int:
+    """Exit 1 when the newest floorsheet is older than --max-age-days.
+
+    A failing capture is loud, but a capture that quietly finds "no session"
+    every day (or a schedule GitHub disabled) is silent. This checks the
+    outcome rather than the process. 7 days clears Dashain/Tihar closures.
+    """
+    with connect(read_only=False) as con:
+        latest = con.execute("SELECT max(business_date) FROM floorsheet").fetchone()[0]
+    today = datetime.now(NPT).date()
+    age = (today - latest).days if latest else None
+    print(f"latest floorsheet={latest} today_npt={today} age_days={age} max={args.max_age_days}")
+    if age is None or age > args.max_age_days:
+        print("STALE: no floorsheet within the allowed window", file=sys.stderr)
+        return 1
+    return 0
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -291,8 +328,12 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("index", help="capture intraday index series").set_defaults(fn=cmd_index)
 
+    fr = sub.add_parser("freshness", help="exit 1 if the newest floorsheet is too old")
+    fr.add_argument("--max-age-days", type=int, default=7)
+    fr.set_defaults(fn=cmd_freshness)
+
     wh = sub.add_parser("warehouse", help="sync published parquet with a HF dataset repo")
-    wh.add_argument("action", choices=["pull", "push"])
+    wh.add_argument("action", choices=["pull", "push", "push-bronze"])
     wh.add_argument("--repo", help="defaults to $HF_DATASET_REPO")
     wh.add_argument("--source-url", default="https://github.com/")
     wh.set_defaults(fn=cmd_warehouse)

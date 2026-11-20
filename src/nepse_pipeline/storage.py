@@ -258,18 +258,46 @@ def export_parquet(con: duckdb.DuckDBPyConnection, table: str, d: date, cfg: Con
     One file per day, not one per poll - 2,880 tiny files a day would make the
     small-files problem the dominant query cost.
     """
+    n = con.execute(f"SELECT count(*) FROM {table} WHERE business_date = ?", [d]).fetchone()[0]
+    if n == 0:
+        # Checked before mkdir: an empty partition directory reads as "this day
+        # was captured and had nothing", which is a different claim from absent.
+        return None
     out_dir = cfg.silver / table / f"business_date={d.isoformat()}"
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / "part-0.parquet"
-    n = con.execute(f"SELECT count(*) FROM {table} WHERE business_date = ?", [d]).fetchone()[0]
-    if n == 0:
-        return None
     con.execute(
         f"COPY (SELECT * FROM {table} WHERE business_date = ? ORDER BY 1) "
         f"TO '{out}' (FORMAT PARQUET, COMPRESSION ZSTD)",
         [d],
     )
     log.info("silver_export table=%s date=%s rows=%d path=%s", table, d, n, out)
+    return out
+
+
+def export_index_intraday(
+    con: duckdb.DuckDBPyConnection, d: date, cfg: Config = CONFIG
+) -> Path | None:
+    """Silver: one Parquet per trading day of the intraday index series.
+
+    The table has no business_date column (its key is the timestamp), so the
+    generic exporter cannot handle it. Without this the series lived only in a
+    CI runner's DuckDB file and was destroyed with the runner - for a dataset
+    NEPSE wipes a few hours after close, that meant it was never kept at all.
+    """
+    where = "CAST(ts AS DATE) = ?"
+    n = con.execute(f"SELECT count(*) FROM index_intraday WHERE {where}", [d]).fetchone()[0]
+    if n == 0:
+        return None
+    out_dir = cfg.silver / "index_intraday" / f"business_date={d.isoformat()}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / "part-0.parquet"
+    con.execute(
+        f"COPY (SELECT index_id, ts, value FROM index_intraday WHERE {where} ORDER BY index_id, ts) "
+        f"TO '{out}' (FORMAT PARQUET, COMPRESSION ZSTD)",
+        [d],
+    )
+    log.info("silver_export table=index_intraday date=%s rows=%d path=%s", d, n, out)
     return out
 
 

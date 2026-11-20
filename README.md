@@ -29,6 +29,7 @@ documentation. Several are load-bearing design constraints.
 
 | Fact | Consequence |
 |---|---|
+| **`.com` and `.com.np` are different servers** (110.44.116.20 / 182.93.68.4), both serving the API. Since 2026-08-25 the `.com.np` server answers a bare nginx 404 to any request whose `Host` header names `.com`. The `nepse` library's `getAuthorizationHeaders()` returns its whole header set, `Host: www.nepalstock.com` included, and we merged it into every request - which is what broke capture for 46 sessions. Verified 2026-11-20: same token, `Host` stripped -> 200, left in -> 404. | Only `Authorization` is taken from the library; our client sends its own Host/UA/Referer. An HTML 404/403 on an API route raises `NepseHostError`. |
 | **No streaming feed exists.** The site polls REST; there is no websocket. | "Live" means polling. |
 | **Backend refreshes every ~24s.** The index graph returns 610 points per 4h session. | Polling faster than ~20s buys nothing. |
 | **A browser `User-Agent` is mandatory.** Without one the connection completes TLS and then hangs forever — no 403, no error. | Every client must set it or die silently. |
@@ -37,7 +38,7 @@ documentation. Several are load-bearing design constraints.
 | **`size` caps at 500.** `size=1000` returns a bare `[]`. | Page size pinned. |
 | **`sort=contractId,desc` is not honoured across pages.** Page 10 was observed starting at `...03013919` and ending at `...04009466`. | A watermark "stop at known id" would **silently skip trades**. Not used. |
 | **Pages intermittently return a bare `[]`** and yield 500 rows on retry. | Treated as transient, never as end-of-data. |
-| **All history endpoints clamp to a rolling 365 days.** `businessDate=2025-08-19` works; `2025-08-15` 404s. Asking the per-security route for a 2010 start silently truncates to exactly one year. | Hard floor on backfill. |
+| **All history endpoints clamp to a rolling 365 days.** `businessDate=2025-08-19` worked and `2025-08-15` 404'd on 2026-08-19; since then the refusal is a **500 `Searched Date is not valid.`**, which NEPSE also returns for *today* before the board is published (2026-11-20). Asking the per-security route for a 2010 start silently truncates to exactly one year. | Hard floor on backfill. Out-of-range counts as the floor only within 7 days of it; otherwise the date is skipped and not recorded. |
 | **The intraday index series is wiped a few hours after close** — 610 points at 19:30 NPT, zero by 20:25. | Must be captured during or right after the session. |
 | **NEPSE traded Sunday–Thursday until ~2026-04-06**, then Monday–Friday. Verified: 2025-11-16 (Sun) returned 337 securities; Fridays before the change are empty. | A `weekday() < 5` weekend filter silently drops ~33 real trading days. Only Saturday is safe to skip. |
 | **Floorsheet ignores `businessDate` entirely** — every historical date returns the current session. Per-company floorsheet is nginx-403'd. | **Tick history cannot be backfilled. Ever.** |
@@ -164,7 +165,9 @@ duckdb.sql("SELECT * FROM 'hf://datasets/AnkitSanjyal/nepse-market-data/floorshe
 ### Why post-close instead of a live poller
 
 NEPSE keeps serving the current session's floorsheet for hours after the 15:00
-NPT close - measured complete at +2h and again at +5.5h, wiped by +5.9h. A single
+NPT close - measured complete at +2h and again at +5.5h, wiped by +5.9h on
+2026-08-20, but complete at +18h (09:01 NPT the next morning, 40,837/40,837) on
+2026-11-20. Treat the window as variable, not as a constant. A single
 short run after close therefore captures the same contracts a four-hour poller
 would, at a twentieth of the compute. The intraday index is the exception: it is
 gone about 4h after close, which is what sets the deadline.
@@ -188,6 +191,12 @@ included, to the paisa.
 |---|---|---|
 | GitHub repo secret | `HF_TOKEN` | a Hugging Face **write** token |
 | GitHub repo variable | `HF_DATASET_REPO` | `AnkitSanjyal/nepse-market-data` |
+| GitHub repo variable (optional) | `HF_BRONZE_REPO` | a **private** dataset repo for raw responses, e.g. `AnkitSanjyal/nepse-bronze`. Unset = raw not archived. Refuses to push to a public repo. |
+
+The heartbeat commit (`STATUS.txt`) runs on every outcome, failures included:
+when it ran only on success, the outage stopped the commits and GitHub disabled
+the schedule for inactivity. Any failure, or a newest floorsheet older than 7
+days, opens or comments on a single `capture-session is failing` issue.
 
 Run the `probe-reachability` workflow first. NEPSE's failure mode is a silent
 hang rather than a 403, so whether it answers a datacenter IP has to be measured
@@ -195,6 +204,12 @@ before the capture job is trusted - the probe reports HUNG, REFUSED, HTTP_4XX or
 OK rather than collapsing them into "it broke".
 
 ## Known gaps
+
+- **Floorsheet gap: 46 sessions, 2026-08-26 -> 2026-11-18** (~2.36M trades by
+  NEPSE's own `totalTrades`). Every request to `.com.np` carried the library's
+  `Host: www.nepalstock.com` header, which that server began rejecting; nothing alerted, and the schedule was then
+  disabled for inactivity. EOD for those days is backfilled. The ticks cannot
+  be recovered from NEPSE.
 
 - **Corporate actions are not adjusted.** Bonus shares and rights issues are
   common on NEPSE and will leave fake gaps in any price series. An adjustment
@@ -205,7 +220,7 @@ OK rather than collapsing them into "it broke".
   there is no deeper authoritative source to prefer. `eod_history_ext`
   comes from ShareSansar and is tagged with its origin; it is never merged into
   the NEPSE tables. Trust it as far as the reconciliation below justifies.
-- **Index intraday history before today cannot be recovered** — same capture-or-lose-it property as floorsheet.
+- **Index intraday history before today cannot be recovered** — same capture-or-lose-it property as floorsheet. It was also never published until 2026-11 (it lived only in the runner's DuckDB); it is now exported to `index_intraday/` and taken *first* in `capture`, but only lands when a run starts within ~4h of close.
 - **Market depth / order book is not collected.** It costs one request per
   symbol and was deliberately deferred.
 - **A sleeping laptop loses the session.** (Superseded by hosted capture above,

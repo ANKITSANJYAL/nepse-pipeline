@@ -9,13 +9,13 @@ window slides - a date that works today is gone in a year. Backfill early.
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from .. import bronze
-from ..config import CONFIG, Config
+from ..config import CONFIG, NPT, Config
 from ..parsers import parse_eod_page
 from ..quality import check_eod, quarantine
-from ..session import NepseError, NepseSession
+from ..session import NepseDateOutOfRange, NepseHostError, NepseSession
 from ..storage import (
     backfill_done_dates,
     connect,
@@ -26,6 +26,10 @@ from ..storage import (
 
 log = logging.getLogger(__name__)
 
+# How close to the 365-day floor an out-of-range answer must be to count as the
+# floor. The window edge has been measured within a day or two of 365.
+FLOOR_SLACK_DAYS = 7
+
 
 def fetch_day(session: NepseSession, d: date, cfg: Config = CONFIG) -> dict:
     """Fetch one business date's full EOD board. Returns a status dict, never raises on 'no data'."""
@@ -35,11 +39,11 @@ def fetch_day(session: NepseSession, d: date, cfg: Config = CONFIG) -> dict:
     while True:
         try:
             payload = session.eod_prices(iso, page=page)
-        except NepseError as exc:
-            # Outside the rolling window NEPSE 404s. That is a boundary, not a bug.
-            if "404" in str(exc):
-                return {"status": "unavailable", "date": d, "rows": 0, "note": "outside 365d window"}
-            raise
+        except NepseDateOutOfRange:
+            # The only signal that means "history boundary". Matching "404" in
+            # the message used to also swallow a host fault (the 2026-08-25 outage), which would
+            # have marked a live date 'unavailable' and stopped the backfill.
+            return {"status": "unavailable", "date": d, "rows": 0, "note": "outside 365d window"}
 
         bronze.write_raw("eod_price", payload, business_date=d, suffix=f"p{page}", cfg=cfg)
         total = int(payload.get("totalElements", 0))
@@ -71,12 +75,15 @@ def backfill(
     cfg: Config = CONFIG,
 ) -> dict:
     """Walk backwards from `end` up to `days`. Resumable - already-done dates are skipped."""
-    end = end or date.today()
+    # NPT, not the host clock: on a US laptop or a UTC runner date.today() is
+    # behind Nepal for part of every day.
+    end = end or datetime.now(NPT).date()
     days = days or cfg.history_window_days
 
     with connect(cfg) as con:
         done = backfill_done_dates(con) if resume else set()
 
+    floor = end - timedelta(days=cfg.history_window_days)
     targets = [end - timedelta(days=i) for i in range(days + 1)]
     # Only Saturday is safe to skip.
     #
@@ -98,6 +105,10 @@ def backfill(
     for i, d in enumerate(targets, 1):
         try:
             r = fetch_day(session, d, cfg=cfg)
+        except NepseHostError:
+            # Not a bad day - every remaining day would fail identically, and
+            # recording 250 'failed' rows would bury the one real cause.
+            raise
         except Exception as exc:  # one bad day must not abort a 250-day backfill
             log.exception("backfill_day_failed date=%s", d)
             with connect(cfg) as con:
@@ -106,6 +117,28 @@ def backfill(
             continue
 
         status = r["status"]
+        if status == "unavailable" and d > floor + timedelta(days=FLOOR_SLACK_DAYS):
+            # NEPSE answers "Searched Date is not valid" for a date whose board
+            # is not published yet (measured: today, pre-open) exactly as it
+            # does past the floor. Recording it would skip the day forever, and
+            # stopping here would skip the whole backfill. Only near the far
+            # end of the window does the signal mean "history ends here".
+            log.info("backfill_not_yet_published date=%s - skipped, not recorded", d)
+            counts["not_yet_published"] = counts.get("not_yet_published", 0) + 1
+            continue
+        if status == "done":
+            # Gate and export each backfilled day, as finalize() does for the
+            # live one. Parquet is what gets published; a day held only in
+            # DuckDB is lost the moment a CI runner rebuilds from Parquet.
+            with connect(cfg) as con:
+                rep = check_eod(con, d)
+                if rep.failures:
+                    why = "; ".join(f"{c.name}: {c.detail}" for c in rep.failures)
+                    log.error("backfill_gate_failed date=%s %s", d, why)
+                    mark_backfill(con, d, "failed", r["rows"], f"gate: {why}"[:400])
+                    counts["failed"] += 1
+                    continue
+                export_parquet(con, "eod_price", d, cfg=cfg)
         counts[status] = counts.get(status, 0) + 1
         rows_total += r["rows"]
         if status in ("empty", "unavailable"):

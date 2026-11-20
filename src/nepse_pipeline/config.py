@@ -22,7 +22,11 @@ def _env_path(key: str, default: str) -> Path:
 
 @dataclass(frozen=True)
 class Config:
-    base_url: str = os.environ.get("NEPSE_BASE_URL", "https://www.nepalstock.com.np")
+    # Both `.com` and `.com.np` serve the API (separate servers). `.com` is the
+    # `nepse` library's own default, so token and data share a host unless
+    # overridden - and the session pins the library to whatever is set here.
+    # See session._TokenSource.auth_headers for the 2026-08-25 outage.
+    base_url: str = os.environ.get("NEPSE_BASE_URL", "https://www.nepalstock.com")
 
     data_root: Path = field(default_factory=lambda: _env_path("NEPSE_DATA_ROOT", "./data"))
 
