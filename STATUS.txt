@@ -1,6 +1,6 @@
-run      : 45686891821  job_status=success  utc=2026-11-25T19:37:20Z
+run      : 45695410923  job_status=success  utc=2026-11-25T20:30:34Z
 market   : CLOSE  asOf=2026-11-25 15:00:00  id=80
-npt now  : 2026-11-26 01:22:23 Thu
+npt now  : 2026-11-26 02:15:36 Thu
 freshness: latest floorsheet date=2026-11-24 ingested_at=2026-11-25 09:46:42.897497
   floorsheet      rows=  383,365  range=2026-08-19..2026-11-24
   eod_price       rows=   94,569  range=2025-08-19..2026-11-24
