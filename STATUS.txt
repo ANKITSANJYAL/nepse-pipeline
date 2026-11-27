@@ -1,6 +1,6 @@
-run      : 45889272356  job_status=success  utc=2026-11-26T20:13:00Z
-market   : CLOSE  asOf=2026-11-26 15:00:00  id=80
-npt now  : 2026-11-27 01:58:02 Fri
+run      : 46054927907  job_status=success  utc=2026-11-27T19:12:27Z
+market   : CLOSE  asOf=2026-11-27 15:00:00  id=80
+npt now  : 2026-11-28 00:57:30 Sat
 freshness: latest floorsheet date=2026-11-24 ingested_at=2026-11-25 09:46:42.897497
   floorsheet      rows=  383,365  range=2026-08-19..2026-11-24
   eod_price       rows=   94,569  range=2025-08-19..2026-11-24
